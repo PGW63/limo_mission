@@ -1,0 +1,114 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- 
+    =====================================================
+    LIMO Mission Main Launch File
+    =====================================================
+    State Manager가 상태를 결정하고, 각 코스별 노드를 실행
+    
+    States (순서대로):
+    1. WAITING_TRAFFIC_LIGHT - 신호등 대기
+    2. DETECT_PEDESTRIAN - 보행자 감지
+    3. ROTARY - 로터리
+    4. OBSTACLE_AVOIDANCE - 장애물 회피
+    5. PARKING - 주차
+    
+    사용법:
+    roslaunch limo_mission mission_main.launch
+    roslaunch limo_mission mission_main.launch initial_state:=DETECT_PEDESTRIAN
+    roslaunch limo_mission mission_main.launch show_image:=false
+    =====================================================
+    -->
+
+    <!-- ========================================
+         Arguments
+    ======================================== -->
+    <arg name="initial_state" default="WAITING_TRAFFIC_LIGHT" doc="Initial state: WAITING_TRAFFIC_LIGHT, DETECT_PEDESTRIAN, ROTARY, OBSTACLE_AVOIDANCE, PARKING"/>
+    <arg name="camera_topic" default="/camera/color/image_raw/compressed"/>
+    <arg name="lidar_topic" default="/scan"/>
+    <arg name="show_image" default="true" doc="Show rqt_image_view windows"/>
+    <arg name="include_bringup" default="false" doc="Include LIMO bringup (camera, base)"/>
+
+    <!-- ========================================
+         Optional: LIMO Bringup (Camera + Base)
+    ======================================== -->
+    <group if="$(arg include_bringup)">
+        <include file="$(find limo_mission)/launch/bringup.launch"/>
+    </group>
+
+    <!-- ========================================
+         Lane Detection Node (공통 - 항상 실행)
+         모든 미션에서 차선 추적 사용
+    ======================================== -->
+    <node pkg="limo_mission" type="lane_detect_node.py" name="lane_detect_node" output="screen">
+        <rosparam file="$(find limo_mission)/config/lane_detect.yaml" command="load"/>
+        <remap from="/camera/color/image_raw/compressed" to="$(arg camera_topic)"/>
+        <!-- State에 따라 cmd_vel 발행 여부는 각 미션 노드가 제어 -->
+        <param name="publish_cmd_vel" value="false"/>
+    </node>
+
+    <!-- ========================================
+         State Manager Node
+         노란색 라인 감지로 상태 전환
+    ======================================== -->
+    <node pkg="limo_mission" type="state_manager.py" name="state_manager" output="screen">
+        <param name="_initial_state" value="$(arg initial_state)"/>
+    </node>
+
+    <!-- ========================================
+         Mission 1: Traffic Light (신호등)
+    ======================================== -->
+    <node pkg="limo_mission" type="modified_traffic_light_node.py" name="traffic_light_node" output="screen">
+        <rosparam file="$(find limo_mission)/config/traffic_light.yaml" command="load"/>
+        <remap from="/camera/color/image_raw/compressed" to="$(arg camera_topic)"/>
+    </node>
+
+    <!-- ========================================
+         Mission 2: Pedestrian (보행자 감지)
+    ======================================== -->
+    <node pkg="limo_mission" type="pedestrian_node.py" name="pedestrian_node" output="screen">
+        <rosparam file="$(find limo_mission)/config/pedestrian.yaml" command="load"/>
+    </node>
+
+    <!-- ========================================
+         Mission 3: Roundabout (로터리)
+    ======================================== -->
+    <node pkg="limo_mission" type="roundabout_node.py" name="roundabout_node" output="screen">
+        <rosparam file="$(find limo_mission)/config/roundabout.yaml" command="load"/>
+        <remap from="/scan" to="$(arg lidar_topic)"/>
+    </node>
+
+    <!-- ========================================
+         Mission 4: Obstacle Avoidance (장애물 회피)
+    ======================================== -->
+    <node pkg="limo_mission" type="obstacle_avoid_node.py" name="obstacle_avoid_node" output="screen">
+        <rosparam file="$(find limo_mission)/config/obstacle_avoid.yaml" command="load"/>
+        <remap from="/scan" to="$(arg lidar_topic)"/>
+    </node>
+
+    <!-- ========================================
+         Mission 5: Parking (주차)
+    ======================================== -->
+    <node pkg="limo_mission" type="aruco_detector_node.py" name="aruco_detector_node" output="screen">
+        <param name="marker_size" value="0.05"/>
+    </node>
+    
+    <node pkg="limo_mission" type="parking_node.py" name="parking_node" output="screen">
+        <rosparam file="$(find limo_mission)/config/parking.yaml" command="load"/>
+    </node>
+
+    <!-- ========================================
+         Mission Controller Node
+         State에 따라 각 미션 노드 enable/disable
+    ======================================== -->
+    <node pkg="limo_mission" type="mission_controller.py" name="mission_controller" output="screen"/>
+
+    <!-- ========================================
+         Image Viewers (Optional)
+    ======================================== -->
+    <group if="$(arg show_image)">
+        <node pkg="rqt_image_view" type="rqt_image_view" name="lane_viewer" args="/limo/lane_detect/image"/>
+        <node pkg="rqt_image_view" type="rqt_image_view" name="state_viewer" args="/state_manager/debug_image/compressed"/>
+    </group>
+
+</launch>
