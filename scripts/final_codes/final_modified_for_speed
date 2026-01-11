@@ -1,0 +1,654 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Advanced Lane Detection Node with Pure Pursuit Control
+- Bird's Eye View transformation
+- Histogram-based sliding window lane detection
+- Single/Dual lane handling with offset
+- Pure Pursuit with PD control
+- State manager integration
+"""
+
+import rospy 
+from sensor_msgs.msg import Image, CompressedImage
+from std_msgs.msg import String, Bool, Float32
+from geometry_msgs.msg import Twist
+from cv_bridge import CvBridge
+import cv2
+import numpy as np
+import time
+
+class LaneDetectionNode:
+    def __init__(self):
+        rospy.init_node('modified_lane_detection_node')
+        self.bridge = CvBridge()
+
+        # White lane detection parameters
+        self.WHITE_LOWER = np.array([0, 200, 0])
+        self.WHITE_UPPER = np.array([255, 255, 200])
+
+        # Bird's Eye View parameters
+        self.img_width = 640
+        self.img_height = 480
+        self.roi_height = 240  # Bottom half (image-space ROI)
+        # BEV near-range keep: keep only bottom N pixels in BEV for fitting (drops far noisy region)
+        self.bev_keep_bottom = 320  # pixels to keep from bottom in BEV (tune 240~360)
+        
+        # Source points (trapezoid in original image)
+        self.src_points = np.float32([
+            [80.0, 310.0],   # Top-left
+            [560.0, 310.0],   # Top-right
+            [640, 480],   # Bottom-right
+            [0, 480]      # Bottom-left
+        ])
+        
+        # Destination points (rectangle in BEV)
+        self.dst_points = np.float32([
+            [120, 0],          # Top-left
+            [520, 0],          # Top-right
+            [520, 480],        # Bottom-right
+            [120, 480]         # Bottom-left
+        ])
+        
+        # Compute perspective transform matrices
+        self.M = cv2.getPerspectiveTransform(self.src_points, self.dst_points)
+        self.M_inv = cv2.getPerspectiveTransform(self.dst_points, self.src_points)
+        
+        # Sliding window parameters
+        self.nwindows = 9
+        self.margin = 50
+        self.minpix = 50
+
+        # Lane tracking (search-around-poly)
+        self.prev_left_fit = None
+        self.prev_right_fit = None
+        self.track_fail_count = 0
+        self.max_track_fail = 30  # after this, force full sliding-window re-detect
+        
+        # Lane offset when single lane detected (pixels in BEV)
+        self.lane_width_m = 0.5  # (approx) distance between left/right lane lines in meters
+        # Fallback centerline offset when only one lane is visible (computed after xm_per_pix is set)
+        self.lane_offset = None  # pixels
+        
+        # Pure Pursuit parameters
+        self.wheelbase = 0.2  # meters (LIMO wheelbase)
+        
+        # === 속도 적응형 파라미터 설정 ===
+        # 기준 속도 (low/high)에서의 파라미터 정의
+        self.speed_low = 0.3   # 저속 기준
+        self.speed_high = 0.8  # 고속 기준
+        
+        # Look-ahead distance: 속도 높을수록 더 멀리 봄
+        self.look_ahead_low = 80    # pixels at low speed
+        self.look_ahead_high = 160  # pixels at high speed
+        self.look_ahead_distance = 100  # 현재 값 (동적 업데이트)
+        
+        # PD gains: 속도 높을수록 P 감소, D 증가 (오버슈트 방지 + 댐핑 강화)
+        # Lateral (횡방향)
+        self.kp_lateral_low = 0.010   # P gain at low speed
+        self.kp_lateral_high = 0.005  # P gain at high speed (감소)
+        self.kd_lateral_low = 0.001   # D gain at low speed
+        self.kd_lateral_high = 0.003  # D gain at high speed (증가)
+        
+        # Heading (헤딩)
+        self.kp_heading_low = 0.6     # P gain at low speed
+        self.kp_heading_high = 0.35   # P gain at high speed (감소)
+        self.kd_heading_low = 0.04    # D gain at low speed
+        self.kd_heading_high = 0.10   # D gain at high speed (증가)
+        
+        # 현재 PD 값 (동적 업데이트)
+        self.kp_lateral = 0.008
+        self.kd_lateral = 0.001
+        self.kp_heading = 0.5
+        self.kd_heading = 0.05
+        
+        self.prev_lateral_error = 0.0
+        self.prev_heading_error = 0.0
+        
+        # Speed control
+        self.base_speed = 0.5  # 기본 속도 (0.5로 상향)
+        self.default_base_speed = 0.5  # 기본 속도 저장
+        self.max_angular_vel = 1.2  # 고속에서 조향 여유 확보
+        
+        # State management
+        self.current_state = None
+        self.enabled = False
+        self.traffic_stop = False  # Traffic light stop flag
+        
+        # 차선 하나만 보일 때 파라미터들
+        
+        bev_lane_width_pixel = abs(self.dst_points[1][0] - self.dst_points[0][0])
+        self.ym_per_pix = 0.01  # meters per pixel in y
+        self.xm_per_pix = self.lane_width_m / bev_lane_width_pixel  # meters per pixel in x
+
+        # Compute lane_offset in pixels from lane_width_m
+        self.lane_offset = int(bev_lane_width_pixel / 2.0) 
+
+        # Subscribers
+        self.image_sub = rospy.Subscriber('/camera/color/image_raw/compressed', CompressedImage, 
+                                         self.image_callback, queue_size=1, buff_size=2**24)
+        self.state_sub = rospy.Subscriber('/state_manager/lane_state', String, self.state_callback, queue_size=1)
+        self.traffic_stop_sub = rospy.Subscriber('/limo/traffic_stop', Bool, self.traffic_stop_callback, queue_size=1)
+        self.base_speed_sub = rospy.Subscriber('/lane_detection/base_speed', Float32, self.base_speed_callback, queue_size=1)
+
+        # Publishers
+        self.white_image_pub = rospy.Publisher('/lane_detection/white_lanes/compressed', CompressedImage, queue_size=1)
+        # Debug: final binary lane mask in image space
+        self.edge_image_pub = rospy.Publisher('/lane_detection/mask/compressed', CompressedImage, queue_size=1)
+        self.bev_image_pub = rospy.Publisher('/lane_detection/bev/compressed', CompressedImage, queue_size=1)
+        self.lane_image_pub = rospy.Publisher('/lane_detection/image/compressed', CompressedImage, queue_size=1)
+        self.cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
+        # Control hold/timeout (prevents stop on brief detection dropouts)
+        self.last_good_time = rospy.Time.now().to_sec()
+        self.last_speed = 0.0
+        self.last_angular = 0.0
+        self.HOLD_SEC = 0.7   # hold last cmd for short dropout
+        self.STOP_SEC = 2.00   # after this, full stop
+
+        # 초기 속도에 맞게 적응형 파라미터 설정
+        self.update_speed_adaptive_params()
+        
+        rospy.loginfo("="*50)
+        rospy.loginfo("Advanced Lane Detection Node Initialized")
+        rospy.loginfo(f"Base speed: {self.base_speed:.2f} m/s")
+        rospy.loginfo(f"Look-ahead: {self.look_ahead_distance} px")
+        rospy.loginfo("Waiting for state: LANE_FOLLOWING")
+        rospy.loginfo("="*50)
+
+    def state_callback(self, msg):
+        """State callback from lane_state topic
+        - LANE_FOLLOWING: 차선 주행 활성화
+        - STOP: 정지 (다른 미션 노드에서 발행)
+        """
+        self.current_state = msg.data
+        # LANE_FOLLOWING이면 활성화, STOP이면 정지
+        self.enabled = (self.current_state.upper() == "LANE_FOLLOWING")
+        rospy.loginfo_throttle(1.0, f"Lane State: {self.current_state}, Enabled: {self.enabled}")
+
+    def traffic_stop_callback(self, msg):
+        """Traffic stop callback - stop when red light detected"""
+        self.traffic_stop = msg.data
+        if self.traffic_stop:
+            rospy.loginfo_throttle(1.0, "Traffic STOP signal received")
+    
+    def base_speed_callback(self, msg):
+        """Base speed callback - dynamically adjust speed from state manager"""
+        new_speed = msg.data
+        if 0.0 <= new_speed <= 1.0:  # 유효 범위 체크
+            self.base_speed = new_speed
+            self.update_speed_adaptive_params()  # 파라미터 업데이트
+            rospy.loginfo_throttle(1.0, f"Base speed changed to: {self.base_speed:.2f}")
+
+    def update_speed_adaptive_params(self):
+        """속도에 따라 PD gains와 look-ahead distance를 동적으로 조정"""
+        speed = self.base_speed
+        
+        # 속도를 0~1 범위로 정규화 (low~high 기준)
+        t = np.clip((speed - self.speed_low) / (self.speed_high - self.speed_low + 1e-6), 0.0, 1.0)
+        
+        # 선형 보간으로 파라미터 계산
+        # Look-ahead distance: 속도 높을수록 증가
+        self.look_ahead_distance = int(self.look_ahead_low + t * (self.look_ahead_high - self.look_ahead_low))
+        
+        # Lateral PD gains
+        self.kp_lateral = self.kp_lateral_low + t * (self.kp_lateral_high - self.kp_lateral_low)
+        self.kd_lateral = self.kd_lateral_low + t * (self.kd_lateral_high - self.kd_lateral_low)
+        
+        # Heading PD gains
+        self.kp_heading = self.kp_heading_low + t * (self.kp_heading_high - self.kp_heading_low)
+        self.kd_heading = self.kd_heading_low + t * (self.kd_heading_high - self.kd_heading_low)
+        
+        rospy.loginfo_throttle(2.0, 
+            f"[Adaptive] speed={speed:.2f} | LA={self.look_ahead_distance} | "
+            f"kp_lat={self.kp_lateral:.4f} kd_lat={self.kd_lateral:.4f} | "
+            f"kp_head={self.kp_heading:.3f} kd_head={self.kd_heading:.3f}")
+
+
+    
+    def publish_cmd(self, speed, angular, mark_good=True):
+        """Publish Twist cmd. If mark_good, update last-good command/time."""
+        cmd = Twist()
+        cmd.linear.x = float(speed)
+        cmd.angular.z = float(angular)
+        self.cmd_vel_pub.publish(cmd)
+        if mark_good:
+            self.last_good_time = rospy.Time.now().to_sec()
+            self.last_speed = float(speed)
+            self.last_angular = float(angular)
+
+    def image_callback(self, msg):
+        """Main image processing callback"""
+        if not self.enabled:
+            # 비활성화 시 cmd_vel 발행하지 않음 (다른 노드가 제어)
+            return
+        
+        # Stop if traffic light is red
+        if self.traffic_stop:
+            self.publish_cmd(0.0, 0.0, mark_good=False)
+            return
+
+        try:
+            # Decode image
+            cv_image = self.bridge.compressed_imgmsg_to_cv2(msg, "bgr8")
+
+            # 1) Build robust binary lane mask (image space)
+            lane_binary = self.detect_lane_binary(cv_image)  # 0/255
+
+            # 2) Warp to BEV (still binary)
+            bev_binary = cv2.warpPerspective(lane_binary, self.M, (self.img_width, self.img_height))
+            # Keep only near-range in BEV to avoid far-range distortion on sharp curves
+            if self.bev_keep_bottom is not None and 0 < self.bev_keep_bottom < self.img_height:
+                cut = self.img_height - int(self.bev_keep_bottom)
+                if cut > 0:
+                    bev_binary[:cut, :] = 0
+
+            # 3) Lane detection: track around previous poly, fallback to sliding window
+            left_fit = right_fit = None
+            out_img = None
+            ok = False
+
+            # Dynamic tracking margin: widen on sharp steering / recent failures
+            dyn_margin = max(self.margin, 80 + 30 * min(self.track_fail_count, 4))
+            if abs(getattr(self, 'last_angular', 0.0)) > 0.6:
+                dyn_margin = max(dyn_margin, 160)
+
+            use_tracking = ((self.prev_left_fit is not None) or (self.prev_right_fit is not None)) and (self.track_fail_count < self.max_track_fail)
+            if use_tracking:
+                left_fit, right_fit, out_img, ok = self.detect_lanes_from_prior(
+                    bev_binary, self.prev_left_fit, self.prev_right_fit, margin=dyn_margin
+                )
+
+            if (not ok) or (out_img is None):
+                # Full re-detect (more expensive but robust)
+                left_fit, right_fit, out_img = self.detect_lanes_sliding_window(bev_binary)
+                ok = (left_fit is not None) or (right_fit is not None)
+
+
+            # Update tracking state
+            if ok:
+                self.prev_left_fit = left_fit if left_fit is not None else self.prev_left_fit
+                self.prev_right_fit = right_fit if right_fit is not None else self.prev_right_fit
+                self.track_fail_count = 0
+            else:
+                self.track_fail_count += 1
+
+            # 4) Generate driving path in BEV coords
+            driving_path = self.generate_driving_path(left_fit, right_fit, bev_binary.shape)
+
+            # 5) Control vehicle
+            if driving_path is not None:
+                self.pure_pursuit_control(driving_path, out_img)
+            else:
+                now = rospy.Time.now().to_sec()
+                dt = now - self.last_good_time
+                if dt < self.HOLD_SEC:
+                    # brief dropout: keep last command
+                    self.publish_cmd(self.last_speed, self.last_angular, mark_good=False)
+                elif dt < self.STOP_SEC:
+                    # longer dropout: slow down gradually but keep steering
+                    k = (self.STOP_SEC - dt) / (self.STOP_SEC - self.HOLD_SEC)
+                    v = max(0.0, self.last_speed * k)
+                    self.publish_cmd(v, self.last_angular, mark_good=False)
+                else:
+                    # too long: stop for safety
+                    self.publish_cmd(0.0, 0.0, mark_good=False)
+                    rospy.logwarn_throttle(1.0, "[lane_detection] Lane lost > STOP_SEC. Stopping.")
+
+            # 6) Publish BEV visualization
+            if out_img is None:
+                out_img = cv2.cvtColor((bev_binary > 0).astype(np.uint8) * 255, cv2.COLOR_GRAY2BGR)
+            bev_msg = self.bridge.cv2_to_compressed_imgmsg(out_img)
+            self.bev_image_pub.publish(bev_msg)
+
+        except Exception as e:
+            rospy.logerr(f"Error in image_callback: {e}")
+    def detect_white_lanes(self, image):
+        """Detect white lanes and return a binary mask (0/255).
+
+        NOTE:
+            Sliding-window + histogram assumes a binary image. Returning a BGR-masked
+            image (as in the previous version) makes histogram peaks unstable,
+            especially on curves. This function now returns a clean binary mask.
+        """
+        # HLS threshold for white-ish lane markings
+        hls = cv2.cvtColor(image, cv2.COLOR_BGR2HLS)
+        hls = cv2.GaussianBlur(hls, (5, 5), 0)
+        white_mask = cv2.inRange(hls, self.WHITE_LOWER, self.WHITE_UPPER)  # 0/255
+
+        # ROI: bottom half only (reduce false positives on sky/buildings)
+        roi_mask = np.zeros_like(white_mask)
+        roi_mask[self.roi_height:, :] = white_mask[self.roi_height:, :]
+
+        # Morphology to connect dashed lines / remove speckles
+        roi_mask = cv2.morphologyEx(roi_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        roi_mask = cv2.morphologyEx(roi_mask, cv2.MORPH_OPEN,  np.ones((3, 3), np.uint8))
+
+        # Publish visualization (masked BGR)
+        white_vis = cv2.bitwise_and(image, image, mask=roi_mask)
+        rosImage_white = self.bridge.cv2_to_compressed_imgmsg(white_vis)
+        self.white_image_pub.publish(rosImage_white)
+
+        return roi_mask
+    def scharr_filter(self, image, mag_thresh=60):
+        """Scharr gradient magnitude -> binary edge mask (0/255).
+
+        Used as a supplement to color thresholding so that curved / worn lane
+        markings remain detectable.
+        """
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image
+
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        grad_x = cv2.Scharr(gray, cv2.CV_64F, 1, 0)
+        grad_y = cv2.Scharr(gray, cv2.CV_64F, 0, 1)
+
+        mag = np.sqrt(grad_x**2 + grad_y**2)
+        mag = (mag / (np.max(mag) + 1e-6) * 255.0).astype(np.uint8)
+
+        edge_mask = np.zeros_like(mag, dtype=np.uint8)
+        edge_mask[mag >= mag_thresh] = 255
+
+        # ROI: bottom half only
+        edge_mask[:self.roi_height, :] = 0
+
+        return edge_mask
+    
+
+    def detect_lane_binary(self, bgr_image):
+        """Build a **binary** lane mask (0/255) in image space.
+
+        IMPORTANT (your environment):
+        - White lanes are reliable with color thresholding already.
+        - Adding generic edges (OR) pulls in reflections/road markings -> steering goes crazy.
+        So we keep the original strong white mask as the primary signal,
+        and only do mild morphology to connect fragments.
+
+        Returns:
+            mask (uint8): 0/255
+        """
+        white_mask = self.detect_white_lanes(bgr_image)  # already ROI-applied, 0/255
+
+        # Mild morphology: connect dashed lines, remove speckles (keep conservative)
+        mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        mask = cv2.morphologyEx(mask,      cv2.MORPH_OPEN,  np.ones((3, 3), np.uint8))
+
+        # Debug publish (optional)
+        try:
+            vis = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            self.edge_image_pub.publish(self.bridge.cv2_to_compressed_imgmsg(vis))
+        except Exception:
+            pass
+
+        return mask
+
+    def detect_lanes_from_prior(self, binary_warped, left_fit_prev, right_fit_prev, margin=80):
+        """Fast and stable lane tracking: search around previous polynomials.
+
+        Returns:
+            (left_fit, right_fit, out_img, confidence_ok)
+        """
+        if binary_warped is None or binary_warped.size == 0:
+            return None, None, None, False
+
+        # Ensure binary is 0/255
+        bw = (binary_warped > 0).astype(np.uint8) * 255
+
+        nonzero = bw.nonzero()
+        nonzeroy = np.array(nonzero[0])
+        nonzerox = np.array(nonzero[1])
+
+        out_img = cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
+
+        left_fit = None
+        right_fit = None
+
+        left_lane_inds = np.array([], dtype=np.int64)
+        right_lane_inds = np.array([], dtype=np.int64)
+
+        if left_fit_prev is not None:
+            left_x_pred = left_fit_prev[0] * (nonzeroy**2) + left_fit_prev[1] * nonzeroy + left_fit_prev[2]
+            left_lane_inds = np.where((nonzerox > (left_x_pred - margin)) & (nonzerox < (left_x_pred + margin)))[0]
+
+        if right_fit_prev is not None:
+            right_x_pred = right_fit_prev[0] * (nonzeroy**2) + right_fit_prev[1] * nonzeroy + right_fit_prev[2]
+            right_lane_inds = np.where((nonzerox > (right_x_pred - margin)) & (nonzerox < (right_x_pred + margin)))[0]
+
+        # Fit new polynomials
+        if left_lane_inds.size > 150:
+            leftx = nonzerox[left_lane_inds]
+            lefty = nonzeroy[left_lane_inds]
+            left_fit = np.polyfit(lefty, leftx, 2)
+            out_img[lefty, leftx] = (255, 0, 0)
+
+        if right_lane_inds.size > 150:
+            rightx = nonzerox[right_lane_inds]
+            righty = nonzeroy[right_lane_inds]
+            right_fit = np.polyfit(righty, rightx, 2)
+            out_img[righty, rightx] = (0, 0, 255)
+
+        # Confidence checks: need at least one lane with enough support
+        ok = (left_fit is not None) or (right_fit is not None)
+
+        # If both exist, sanity check lane width (in pixels, roughly)
+        if left_fit is not None and right_fit is not None:
+            y_eval = bw.shape[0] - 1
+            left_x = left_fit[0] * y_eval**2 + left_fit[1] * y_eval + left_fit[2]
+            right_x = right_fit[0] * y_eval**2 + right_fit[1] * y_eval + right_fit[2]
+            lane_w = right_x - left_x
+            # Expect lane width within a broad range in BEV pixels (tune if you know)
+            if not (140 <= lane_w <= 520):
+                ok = False
+
+        return left_fit, right_fit, out_img, ok
+
+    def detect_lanes_sliding_window(self, binary_warped):
+        """Detect lanes using histogram-based sliding window"""
+        # Ensure binary is 0/255
+        bw = (binary_warped > 0).astype(np.uint8)
+        bw255 = bw * 255
+
+        # Take histogram of bottom half (counts, not intensity)
+        histogram = np.sum(bw[(3*bw.shape[0])//4:, :], axis=0)  # use bottom quarter for seed (better on sharp curves)
+
+        # Create output image for visualization
+        out_img = cv2.cvtColor(bw255, cv2.COLOR_GRAY2BGR)
+        # Find peaks in left and right halves
+        midpoint = np.int32(histogram.shape[0] // 2)
+        leftx_base = np.argmax(histogram[:midpoint])
+        rightx_base = np.argmax(histogram[midpoint:]) + midpoint
+        
+        # Check if peaks are significant
+        left_peak_value = histogram[leftx_base] if leftx_base < len(histogram) else 0
+        right_peak_value = histogram[rightx_base] if rightx_base < len(histogram) else 0
+        
+        threshold = max(30, int(0.02 * np.max(histogram)))  # adaptive peak threshold
+        left_detected = left_peak_value > threshold
+        right_detected = right_peak_value > threshold
+        
+        # Set current positions
+        leftx_current = leftx_base if left_detected else None
+        rightx_current = rightx_base if right_detected else None
+        
+        # Window height
+        window_height = np.int32(binary_warped.shape[0] // self.nwindows)
+        
+        # Identify nonzero pixels
+        nonzero = bw255.nonzero()
+        nonzeroy = np.array(nonzero[0])
+        nonzerox = np.array(nonzero[1])
+        
+        # Lists to store lane pixel indices
+        left_lane_inds = []
+        right_lane_inds = []
+        
+        # Step through windows
+        for window in range(self.nwindows):
+            # Window boundaries
+            win_y_low = binary_warped.shape[0] - (window + 1) * window_height
+            win_y_high = binary_warped.shape[0] - window * window_height
+            
+            # Left lane window
+            if leftx_current is not None:
+                win_xleft_low = leftx_current - self.margin
+                win_xleft_high = leftx_current + self.margin
+                cv2.rectangle(out_img, (win_xleft_low, win_y_low), (win_xleft_high, win_y_high), (0, 255, 0), 2)
+                
+                good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
+                                 (nonzerox >= win_xleft_low) & (nonzerox < win_xleft_high)).nonzero()[0]
+                left_lane_inds.append(good_left_inds)
+                
+                if len(good_left_inds) > self.minpix:
+                    leftx_current = np.int32(np.mean(nonzerox[good_left_inds]))
+            
+            # Right lane window
+            if rightx_current is not None:
+                win_xright_low = rightx_current - self.margin
+                win_xright_high = rightx_current + self.margin
+                cv2.rectangle(out_img, (win_xright_low, win_y_low), (win_xright_high, win_y_high), (0, 255, 0), 2)
+                
+                good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
+                                  (nonzerox >= win_xright_low) & (nonzerox < win_xright_high)).nonzero()[0]
+                right_lane_inds.append(good_right_inds)
+                
+                if len(good_right_inds) > self.minpix:
+                    rightx_current = np.int32(np.mean(nonzerox[good_right_inds]))
+        
+        # Concatenate indices
+        left_lane_inds = np.concatenate(left_lane_inds) if len(left_lane_inds) > 0 else np.array([])
+        right_lane_inds = np.concatenate(right_lane_inds) if len(right_lane_inds) > 0 else np.array([])
+        
+        # Extract pixel positions
+        left_fit = None
+        right_fit = None
+        
+        if len(left_lane_inds) > 0:
+            leftx = nonzerox[left_lane_inds]
+            lefty = nonzeroy[left_lane_inds]
+            if len(leftx) > 3:
+                left_fit = np.polyfit(lefty, leftx, 2)
+                out_img[lefty, leftx] = [255, 0, 0]
+        
+        if len(right_lane_inds) > 0:
+            rightx = nonzerox[right_lane_inds]
+            righty = nonzeroy[right_lane_inds]
+            if len(rightx) > 3:
+                right_fit = np.polyfit(righty, rightx, 2)
+                out_img[righty, rightx] = [0, 0, 255]
+        
+        return left_fit, right_fit, out_img
+    
+    def generate_driving_path(self, left_fit, right_fit, img_shape):
+        """Generate driving path from detected lanes"""
+        ploty = np.linspace(0, img_shape[0]-1, img_shape[0])
+        
+        if left_fit is not None and right_fit is not None:
+            # Both lanes detected - drive in the middle
+            left_fitx = left_fit[0]*ploty**2 + left_fit[1]*ploty + left_fit[2]
+            right_fitx = right_fit[0]*ploty**2 + right_fit[1]*ploty + right_fit[2]
+            driving_fitx = (left_fitx + right_fitx) / 2
+            
+        elif left_fit is not None:
+            # Only left lane - offset to the right
+            left_fitx = left_fit[0]*ploty**2 + left_fit[1]*ploty + left_fit[2]
+            driving_fitx = left_fitx + self.lane_offset
+            
+        elif right_fit is not None:
+            # Only right lane - offset to the left
+            right_fitx = right_fit[0]*ploty**2 + right_fit[1]*ploty + right_fit[2]
+            driving_fitx = right_fitx - self.lane_offset
+            
+        else:
+            # No lanes detected
+            return None
+        
+        # Create path as (x, y) points
+        driving_path = np.column_stack((driving_fitx, ploty))
+        
+        return driving_path
+    
+    def pure_pursuit_control(self, driving_path, debug_img):
+        """Pure Pursuit control with PD for lateral and heading errors"""
+        if driving_path is None or len(driving_path) == 0:
+            return
+        
+        # Vehicle position (bottom center of BEV image)
+        vehicle_x = self.img_width // 2
+        vehicle_y = self.img_height
+        
+        # Find look-ahead point
+        look_ahead_idx = max(0, vehicle_y - self.look_ahead_distance)
+        look_ahead_idx = min(look_ahead_idx, len(driving_path) - 1)
+        
+        target_point = driving_path[int(look_ahead_idx)]
+        target_x = target_point[0]
+        target_y = target_point[1]
+        
+        # Draw driving path on debug image
+        for i in range(len(driving_path) - 1):
+            pt1 = (int(driving_path[i][0]), int(driving_path[i][1]))
+            pt2 = (int(driving_path[i+1][0]), int(driving_path[i+1][1]))
+            cv2.line(debug_img, pt1, pt2, (0, 255, 255), 2)
+        
+        # Draw look-ahead point
+        cv2.circle(debug_img, (int(target_x), int(target_y)), 10, (255, 0, 255), -1)
+        cv2.circle(debug_img, (vehicle_x, vehicle_y), 10, (0, 255, 0), -1)
+        
+        # Calculate lateral error (horizontal distance from center)
+        lateral_error = (target_x - vehicle_x) * self.xm_per_pix
+        
+        # Calculate heading error (angle to target point)
+        dx = target_x - vehicle_x
+        dy = vehicle_y - target_y
+        heading_error = np.arctan2(dx, dy + 1e-6)  # avoid division by zero
+        
+        # PD control for lateral error
+        lateral_derivative = lateral_error - self.prev_lateral_error
+        lateral_control = self.kp_lateral * lateral_error + self.kd_lateral * lateral_derivative
+        
+        # PD control for heading error
+        heading_derivative = heading_error - self.prev_heading_error
+        heading_control = self.kp_heading * heading_error + self.kd_heading * heading_derivative
+        
+        # Combine controls
+        angular_vel = lateral_control + heading_control
+        angular_vel = -1.0*np.clip(angular_vel, -self.max_angular_vel, self.max_angular_vel)
+        
+        # Adjust speed based on steering angle
+        speed = self.base_speed * (1.0 - 0.5 * abs(angular_vel) / self.max_angular_vel)
+        
+        # Publish cmd_vel (and update last-good)
+        self.publish_cmd(speed, angular_vel, mark_good=True)
+        
+        # Update previous errors
+        self.prev_lateral_error = lateral_error
+        self.prev_heading_error = heading_error
+        
+        # Debug info
+        cv2.putText(debug_img, f"Lat Err: {lateral_error:.3f}m", (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(debug_img, f"Head Err: {np.degrees(heading_error):.1f}deg", (10, 60), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(debug_img, f"Speed: {speed:.2f} (base:{self.base_speed:.2f})", (10, 90), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(debug_img, f"Angular: {angular_vel:.2f}", (10, 120), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(debug_img, f"LA: {self.look_ahead_distance}px", (10, 150), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 0), 1)
+
+    def run(self):
+        """Run the node"""
+        rospy.spin()
+
+
+def main():
+    try:
+        node = LaneDetectionNode()
+        node.run()
+    except rospy.ROSInterruptException:
+        pass
+
+if __name__ == '__main__':
+    main()
